@@ -10,7 +10,7 @@ import asyncio
 import urllib.request
 from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 import feedparser
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -152,6 +152,57 @@ RSS_FEEDS = [
     "https://www.skysports.com/rss/12040",
     "https://www.espn.com/espn/rss/soccer/news",
 ]
+
+# Official club news domains. Google News RSS is queried against these domains
+# first, then against wider football coverage for the selected club.
+OFFICIAL_DOMAINS = {
+    "Arsenal": "arsenal.com",
+    "Liverpool": "liverpoolfc.com",
+    "Manchester City": "mancity.com",
+    "Manchester United": "manutd.com",
+    "Chelsea": "chelseafc.com",
+    "Tottenham Hotspur": "tottenhamhotspur.com",
+    "Newcastle United": "nufc.co.uk",
+    "Aston Villa": "avfc.co.uk",
+    "West Ham United": "whufc.com",
+    "Everton": "evertonfc.com",
+    "Nottingham Forest": "nottinghamforest.co.uk",
+    "Brighton": "brightonandhovealbion.com",
+    "Crystal Palace": "cpfc.co.uk",
+    "Wolverhampton Wanderers": "wolves.co.uk",
+    "Brentford": "brentfordfc.com",
+    "Real Madrid": "realmadrid.com",
+    "Barcelona": "fcbarcelona.com",
+    "Atletico Madrid": "atleticodemadrid.com",
+    "Sevilla": "sevillafc.es",
+    "Valencia": "valenciacf.com",
+    "Athletic Club": "athletic-club.eus",
+    "Real Sociedad": "realsociedad.eus",
+    "Villarreal": "villarrealcf.es",
+    "Real Betis": "realbetisbalompie.es",
+    "Girona": "gironafc.cat",
+    "Juventus": "juventus.com",
+    "Inter Milan": "inter.it",
+    "AC Milan": "acmilan.com",
+    "Napoli": "sscnapoli.it",
+    "AS Roma": "asroma.com",
+    "Lazio": "sslazio.it",
+    "Atalanta": "atalanta.it",
+    "Bayern Munich": "fcbayern.com",
+    "Borussia Dortmund": "bvb.de",
+    "Bayer Leverkusen": "bayer04.de",
+    "RB Leipzig": "rbleipzig.com",
+    "Eintracht Frankfurt": "eintracht.de",
+    "VfB Stuttgart": "vfb.de",
+    "Paris Saint-Germain": "psg.fr",
+    "Marseille": "om.fr",
+    "Lyon": "ol.fr",
+    "Monaco": "asmonaco.com",
+    "Lille": "losc.fr",
+    "Nice": "ogcnice.com",
+    "Rennes": "staderennais.com",
+    "Lens": "rclens.fr",
+}
 
 WELCOME = (
     "⚽ MOD FOOTBALL BOT IS HERE!\n\n"
@@ -420,6 +471,68 @@ def fetch_rss_entries():
     return list(unique.values())
 
 
+
+def fetch_google_news_feed(query):
+    """Fetch a targeted Google News RSS search and return publisher story links."""
+    feed_url = (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(query)
+        + "&hl=en&gl=US&ceid=US:en"
+    )
+    try:
+        feed = feedparser.parse(feed_url)
+        found = []
+        for entry in feed.entries[:25]:
+            title = clean_text(entry.get("title"))
+            link = entry.get("link", "")
+            if not title or not link.startswith("http"):
+                continue
+            summary = clean_text(entry.get("summary") or entry.get("description") or "")
+            published = parse_published(entry)
+            if datetime.now(timezone.utc) - published > timedelta(hours=MAX_FEED_AGE_HOURS):
+                continue
+            found.append({
+                "story_id": make_story_id(link, title),
+                "title": title,
+                "url": link,
+                "source": clean_text(entry.get("source", {}).get("title")) or source_name(link),
+                "summary": summary[:5000],
+                "image_url": entry_image(entry),
+                "published_at": published.isoformat(),
+            })
+        return found
+    except Exception as exc:
+        logger.warning("Google News search failed for %r: %s", query, exc)
+        return []
+
+
+def fetch_news_for_user(user):
+    """Get fresh news for this user's exact club or selected league."""
+    league = user["league"]
+    if user["mode"] == "team":
+        team = user["team"]
+        if not team:
+            return []
+        domain = OFFICIAL_DOMAINS.get(team)
+        queries = []
+        if domain:
+            # Official club site first; wider coverage is the fallback/additional source.
+            queries.append(f'site:{domain} "{team}" football')
+        queries.append(f'"{team}" football news')
+    else:
+        club_names = [name for name, _aliases in TEAMS.get(league, [])]
+        # Popular-club coverage for the selected league, not just the current top table.
+        queries = [
+            "(" + " OR ".join(f'"{name}"' for name in club_names) + ") football news"
+        ]
+
+    combined = {}
+    for query in queries:
+        for story in fetch_google_news_feed(query):
+            combined[story["story_id"]] = story
+    return list(combined.values())
+
+
 def normalize(value):
     return re.sub(r"[^a-z0-9 ]+", " ", (value or "").lower()).strip()
 
@@ -568,53 +681,60 @@ async def send_story(bot, user_id, story, article):
             )
 
 
+async def check_and_send_user_news(bot, user):
+    user_id = user["user_id"]
+    stories = await asyncio.to_thread(fetch_news_for_user, user)
+    if not stories:
+        logger.info("No fresh stories found for user %s.", user_id)
+        return 0
+
+    for story in stories:
+        save_story(story)
+
+    sent_count = 0
+    for story in stories:
+        if sent_count >= MAX_STORIES_PER_USER_PER_CHECK:
+            break
+        if was_sent(user_id, story["story_id"]):
+            continue
+        if not story_matches_user(story, user):
+            continue
+
+        article = await get_article(story)
+        if not article:
+            continue
+
+        try:
+            await bot.send_chat_action(user_id, ChatAction.TYPING)
+            await send_story(bot, user_id, story, article)
+            mark_sent(user_id, story["story_id"])
+            sent_count += 1
+            await asyncio.sleep(1.0)
+        except Exception as exc:
+            error_text = str(exc).lower()
+            logger.warning("Could not send news to %s: %s", user_id, exc)
+            if "bot was blocked" in error_text or "chat not found" in error_text:
+                with db_connection() as conn:
+                    conn.execute(
+                        "UPDATE subscribers SET active=0 WHERE user_id=?",
+                        (user_id,),
+                    )
+                    conn.commit()
+    return sent_count
+
+
 async def check_and_send_news(bot):
-    logger.info("Starting 10-minute football news check.")
+    logger.info("Starting 10-minute personalised football news check.")
     subscribers = get_subscribers()
     if not subscribers:
         logger.info("No users have completed league/news selection yet.")
         return
 
-    stories = await asyncio.to_thread(fetch_rss_entries)
-    if not stories:
-        logger.info("No fresh stories found in the RSS feeds.")
-        return
-
-    # Store each source story once. The same story can be relevant to many users.
-    for story in stories:
-        save_story(story)
-
     for user in subscribers:
-        sent_count = 0
-        for story in stories:
-            if sent_count >= MAX_STORIES_PER_USER_PER_CHECK:
-                break
-            if was_sent(user["user_id"], story["story_id"]):
-                continue
-            if not story_matches_user(story, user):
-                continue
-
-            article = await get_article(story)
-            if not article:
-                continue
-
-            try:
-                await bot.send_chat_action(user["user_id"], ChatAction.TYPING)
-                await send_story(bot, user["user_id"], story, article)
-                mark_sent(user["user_id"], story["story_id"])
-                sent_count += 1
-                await asyncio.sleep(1.2)
-            except Exception as exc:
-                error_text = str(exc).lower()
-                logger.warning("Could not send news to %s: %s", user["user_id"], exc)
-                if "bot was blocked" in error_text or "chat not found" in error_text:
-                    with db_connection() as conn:
-                        conn.execute(
-                            "UPDATE subscribers SET active=0 WHERE user_id=?",
-                            (user["user_id"],),
-                        )
-                        conn.commit()
-                # Do not mark failed deliveries as sent; the bot can retry next check.
+        try:
+            await check_and_send_user_news(bot, user)
+        except Exception:
+            logger.exception("News check failed for user %s.", user["user_id"])
 
 
 def league_keyboard():
@@ -732,12 +852,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["league"] = league
         set_user_preferences(user_id, league=league, mode="all", team=None)
         await query.edit_message_text(
-            f"✅ Your preference is saved!\n\n"
-            f"You will receive new news about the 15 popular clubs in {LEAGUES[league]}.\n"
-            "I will check for fresh news every 10 minutes.\n\n"
+            f"✅ Your preference is saved!\\n\\n"
+            f"You will receive new news about the 15 popular clubs in {LEAGUES[league]}.\\n"
+            "I am searching for the latest stories now. New updates are checked every 10 minutes.\\n\\n"
             "Use /menu any time to change your selection.",
             reply_markup=fan_menu_keyboard(),
         )
+        await query.message.reply_text("🔎 Finding the latest news for your selected league...")
+        current_user = get_user(user_id)
+        if current_user:
+            await check_and_send_user_news(context.bot, current_user)
         return
 
     if data == "mode:team":
@@ -772,11 +896,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         set_user_preferences(user_id, league=league, mode="team", team=team_name)
         await query.edit_message_text(
-            f"✅ You are now following {team_name} news in {LEAGUES[league]}.\n\n"
-            "I will check for fresh news every 10 minutes and send new updates only.\n\n"
+            f"✅ You are now following {team_name} news in {LEAGUES[league]}.\\n\\n"
+            f"🔎 I am searching {team_name}'s official website first, then other football news sources.\\n"
+            "New updates are checked every 10 minutes.\\n\\n"
             "Use /menu any time to change your selection.",
             reply_markup=fan_menu_keyboard(),
         )
+        current_user = get_user(user_id)
+        if current_user:
+            await check_and_send_user_news(context.bot, current_user)
         return
 
     if data == "news:now":
@@ -786,8 +914,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Automatic checks continue every 10 minutes.",
             reply_markup=fan_menu_keyboard(),
         )
-        # Run a scan for all subscribers; this user's preferences are applied during matching.
-        asyncio.create_task(check_and_send_news(context.bot))
+        current_user = get_user(user_id)
+        if current_user:
+            await check_and_send_user_news(context.bot, current_user)
         return
 
 
