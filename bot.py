@@ -1,255 +1,702 @@
+
 import os
 import re
+import json
+import html
+import hashlib
 import logging
+import sqlite3
+import asyncio
 import urllib.request
-import xml.etree.ElementTree as ET
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import urllib.error
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import feedparser
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logging.basicConfig(level=logging.INFO)
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BBC_RSS = "https://feeds.bbci.co.uk/sport/football/rss.xml"
-READ_MORE_URL = "https://www.bbc.com/sport/football"
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-# ---- Top 5 leagues + teams ----
-LEAGUES = {
-    "premier_league": {
-        "name": "🏴 Premier League",
-        "teams": ["Arsenal", "Chelsea", "Liverpool", "Manchester United",
-                  "Manchester City", "Tottenham"]
-    },
-    "la_liga": {
-        "name": "🇪🇸 La Liga",
-        "teams": ["Real Madrid", "Barcelona", "Atletico Madrid", "Sevilla"]
-    },
-    "serie_a": {
-        "name": "🇮🇹 Serie A",
-        "teams": ["Juventus", "AC Milan", "Inter Milan", "Napoli"]
-    },
-    "bundesliga": {
-        "name": "🇩🇪 Bundesliga",
-        "teams": ["Bayern Munich", "Borussia Dortmund", "RB Leipzig"]
-    },
-    "ligue_1": {
-        "name": "🇫🇷 Ligue 1",
-        "teams": ["PSG", "Marseille", "Lyon", "Monaco"]
-    },
-}
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
 
-# In-memory storage: user_id -> {"league":..., "team":...}
-user_prefs = {}
+DATABASE_PATH = os.getenv("DATABASE_PATH", "football_bot.db")
+
+CHECK_INTERVAL_MINUTES = 15
+MAX_NEW_STORIES_PER_CHECK = 3
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
 
 # =========================================================
-# HELPERS
+# FOOTBALL NEWS SOURCES
 # =========================================================
 
-def clean_html(text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", text or "")
-    return text.strip()
+RSS_FEEDS = [
+    "https://feeds.bbci.co.uk/sport/football/rss.xml",
+    "https://www.skysports.com/rss/12040",
+    "https://www.theguardian.com/football/rss",
+    "https://www.espn.com/espn/rss/soccer/news",
+]
 
-def truncate(text: str, limit: int = 500) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit].rsplit(" ", 1)[0] + "..."
 
-def fetch_news(team_filter: str = None, limit: int = 15):
-    try:
-        req = urllib.request.Request(
-            BBC_RSS,
-            headers={"User-Agent": "Mozilla/5.0 (FootballBot/1.0)"}
+# =========================================================
+# DATABASE
+# =========================================================
+
+def get_connection():
+    folder = os.path.dirname(os.path.abspath(DATABASE_PATH))
+    os.makedirs(folder, exist_ok=True)
+
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            user_id INTEGER PRIMARY KEY,
+            joined_at TEXT
         )
-        with urllib.request.urlopen(req, timeout=15) as response:
-            raw = response.read()
-    except Exception as e:
-        logging.warning(f"RSS fetch failed: {e}")
-        return []
+    """)
 
-    try:
-        root = ET.fromstring(raw)
-    except ET.ParseError as e:
-        logging.warning(f"RSS parse failed: {e}")
-        return []
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS published_news (
+            story_id TEXT PRIMARY KEY,
+            title TEXT,
+            published_at TEXT
+        )
+    """)
 
-    results = []
-    for item in root.iter("item"):
-        title_el = item.find("title")
-        desc_el = item.find("description")
-        link_el = item.find("link")
+    connection.commit()
+    return connection
 
-        title = clean_html(title_el.text if title_el is not None else "")
-        summary = clean_html(desc_el.text if desc_el is not None else "")
-        link = link_el.text if link_el is not None else READ_MORE_URL
 
-        if not title:
-            continue
+def add_subscriber(user_id):
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO subscribers (user_id, joined_at) VALUES (?, ?)",
+            (user_id, datetime.now(timezone.utc).isoformat()),
+        )
 
-        if team_filter:
-            blob = (title + " " + summary).lower()
-            if team_filter.lower() not in blob:
-                continue
 
-        results.append({"title": title, "summary": summary, "link": link})
-        if len(results) >= limit:
-            break
+def get_subscribers():
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT user_id FROM subscribers"
+        ).fetchall()
 
-    return results
+    return [row[0] for row in rows]
 
-def build_read_more_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 READ MORE", url=READ_MORE_URL)]
-    ])
+
+def is_published(story_id):
+    with get_connection() as connection:
+        result = connection.execute(
+            "SELECT 1 FROM published_news WHERE story_id = ?",
+            (story_id,),
+        ).fetchone()
+
+    return result is not None
+
+
+def save_published(story_id, title):
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO published_news
+            (story_id, title, published_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                story_id,
+                title,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
 
 # =========================================================
-# /start
+# TEXT AND IMAGE HELPERS
+# =========================================================
+
+def clean_html(text):
+    text = html.unescape(text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def get_story_id(title):
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        title.lower(),
+    ).strip()
+
+    return hashlib.sha256(
+        normalized.encode("utf-8")
+    ).hexdigest()
+
+
+def get_image_from_entry(entry):
+    # RSS media content
+    for media in entry.get("media_content", []):
+        image_url = media.get("url")
+        if image_url:
+            return image_url
+
+    # RSS thumbnail
+    for media in entry.get("media_thumbnail", []):
+        image_url = media.get("url")
+        if image_url:
+            return image_url
+
+    # RSS enclosure
+    for enclosure in entry.get("enclosures", []):
+        image_url = enclosure.get("href") or enclosure.get("url")
+        if image_url and "image" in enclosure.get("type", ""):
+            return image_url
+
+    # Image links
+    for link in entry.get("links", []):
+        if link.get("rel") == "enclosure":
+            image_url = link.get("href")
+            if image_url and (
+                "image" in link.get("type", "")
+                or re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", image_url, re.I)
+            ):
+                return image_url
+
+    return None
+
+
+def get_page_image(article_url):
+    if not article_url:
+        return None
+
+    try:
+        request = urllib.request.Request(
+            article_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+        with urllib.request.urlopen(request, timeout=10) as response:
+            page = response.read(300000).decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, page, re.I)
+            if match:
+                image_url = html.unescape(match.group(1))
+                if image_url.startswith("http"):
+                    return image_url
+
+    except Exception as error:
+        logger.warning("Could not retrieve article image: %s", error)
+
+    return None
+
+
+# =========================================================
+# FETCH ONLINE FOOTBALL NEWS
+# =========================================================
+
+def fetch_news(limit=30):
+    stories = []
+    seen_titles = set()
+
+    for feed_url in RSS_FEEDS:
+        try:
+            request = urllib.request.Request(
+                feed_url,
+                headers={"User-Agent": "Mozilla/5.0 (FootballBot/2.0)"},
+            )
+
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read()
+
+            feed = feedparser.parse(raw)
+
+            for entry in feed.entries[:15]:
+                title = clean_html(entry.get("title", ""))
+                summary = clean_html(
+                    entry.get("summary", "")
+                    or entry.get("description", "")
+                )
+                link = entry.get("link", "")
+
+                if not title or not link:
+                    continue
+
+                story_id = get_story_id(title)
+
+                if story_id in seen_titles:
+                    continue
+
+                seen_titles.add(story_id)
+
+                published = entry.get("published", "")
+
+                image_url = get_image_from_entry(entry)
+
+                stories.append({
+                    "id": story_id,
+                    "title": title,
+                    "summary": summary,
+                    "link": link,
+                    "image": image_url,
+                    "published": published,
+                    "source": feed.feed.get("title", "Football News"),
+                })
+
+        except Exception as error:
+            logger.warning(
+                "Could not read RSS feed %s: %s",
+                feed_url,
+                error,
+            )
+
+    # Prefer newer stories when publication dates are available.
+    def sort_date(story):
+        try:
+            return parsedate_to_datetime(
+                story["published"]
+            ).timestamp()
+        except Exception:
+            return 0
+
+    stories.sort(key=sort_date, reverse=True)
+
+    return stories[:limit]
+
+
+# =========================================================
+# DEEPSEEK ARTICLE GENERATOR
+# =========================================================
+
+def generate_article(story):
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY is missing from Railway Variables."
+        )
+
+    prompt = f"""
+Write an original football news article based on the information below.
+
+ARTICLE REQUIREMENTS:
+- Write between 500 and 700 words.
+- Use simple, natural, professional English.
+- Give the article an engaging headline.
+- Explain the important details clearly.
+- Include relevant football background where it helps readers understand the story.
+- Organize the article into readable paragraphs with useful subheadings.
+- Do not invent scores, dates, injuries, transfers, quotes, statistics or statements.
+- Do not present rumours as confirmed facts.
+- If information is not available, do not make it up.
+- Do not claim to have interviewed anyone.
+- Keep the article focused on the supplied news.
+- Do not include a fake source or fake quotation.
+
+SOURCE HEADLINE:
+{story["title"]}
+
+SOURCE SUMMARY:
+{story["summary"]}
+
+ORIGINAL SOURCE:
+{story["link"]}
+
+SOURCE NAME:
+{story["source"]}
+
+Write the complete article now.
+"""
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional football journalist. "
+                    "Report accurately and never invent facts."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "temperature": 0.5,
+        "max_tokens": 2200,
+        "stream": False,
+    }
+
+    request = urllib.request.Request(
+        DEEPSEEK_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=90) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    article = result["choices"][0]["message"]["content"].strip()
+
+    word_count = len(article.split())
+
+    # Ask DeepSeek to expand an article if it is too short.
+    if word_count < 500:
+        expand_payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful football journalist. "
+                        "Never invent facts."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Expand the following article to between 500 and "
+                        "700 words. Preserve all facts, do not invent "
+                        "details, and keep the original meaning:\n\n"
+                        + article
+                    ),
+                },
+            ],
+            "temperature": 0.4,
+            "max_tokens": 2200,
+            "stream": False,
+        }
+
+        request = urllib.request.Request(
+            DEEPSEEK_URL,
+            data=json.dumps(expand_payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        expanded = result["choices"][0]["message"]["content"].strip()
+
+        if len(expanded.split()) > word_count:
+            article = expanded
+
+    return article
+
+
+# =========================================================
+# TELEGRAM MESSAGE DELIVERY
+# =========================================================
+
+def split_message(text, limit=3800):
+    paragraphs = text.split("\n")
+    chunks = []
+    current = ""
+
+    for paragraph in paragraphs:
+        if len(current) + len(paragraph) + 2 <= limit:
+            current += paragraph + "\n\n"
+        else:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+
+            while len(paragraph) > limit:
+                chunks.append(paragraph[:limit])
+                paragraph = paragraph[limit:]
+
+            current = paragraph + "\n\n"
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
+
+
+async def send_article(bot, user_id, story, article, image_url):
+    headline = story["title"]
+    source_link = story["link"]
+
+    caption = (
+        f"⚽ {headline}\n\n"
+        f"📰 Source: {source_link}"
+    )
+
+    photo_sent = False
+
+    if image_url:
+        try:
+            await bot.send_photo(
+                chat_id=user_id,
+                photo=image_url,
+                caption=caption[:1024],
+            )
+            photo_sent = True
+
+        except Exception as error:
+            logger.warning(
+                "Could not send image for %s: %s",
+                headline,
+                error,
+            )
+
+    if not photo_sent:
+        await bot.send_message(
+            chat_id=user_id,
+            text=caption,
+            disable_web_page_preview=False,
+        )
+
+    for part in split_message(article):
+        await bot.send_message(
+            chat_id=user_id,
+            text=part,
+            disable_web_page_preview=True,
+        )
+
+    await bot.send_message(
+        chat_id=user_id,
+        text=f"🔗 Read the original report: {source_link}",
+        disable_web_page_preview=True,
+    )
+
+
+# =========================================================
+# NEWS CHECK AND AUTOMATIC BROADCAST
+# =========================================================
+
+async def check_and_send_news(bot):
+    subscribers = get_subscribers()
+
+    if not subscribers:
+        logger.info("No subscribers yet. Waiting for users to start the bot.")
+        return
+
+    logger.info("Checking online football news...")
+
+    stories = await asyncio.to_thread(fetch_news, 40)
+
+    new_stories = [
+        story for story in stories
+        if not is_published(story["id"])
+    ]
+
+    if not new_stories:
+        logger.info("No new football stories found.")
+        return
+
+    new_stories = new_stories[:MAX_NEW_STORIES_PER_CHECK]
+
+    for story in new_stories:
+        try:
+            logger.info("Generating article: %s", story["title"])
+
+            article = await asyncio.to_thread(
+                generate_article,
+                story,
+            )
+
+            image_url = story["image"]
+
+            if not image_url:
+                image_url = await asyncio.to_thread(
+                    get_page_image,
+                    story["link"],
+                )
+
+            successful_sends = 0
+
+            for user_id in subscribers:
+                try:
+                    await send_article(
+                        bot,
+                        user_id,
+                        story,
+                        article,
+                        image_url,
+                    )
+                    successful_sends += 1
+
+                except Exception as error:
+                    logger.warning(
+                        "Could not send news to user %s: %s",
+                        user_id,
+                        error,
+                    )
+
+                    # Remove users who have blocked the bot.
+                    if "bot was blocked" in str(error).lower():
+                        with get_connection() as connection:
+                            connection.execute(
+                                "DELETE FROM subscribers WHERE user_id = ?",
+                                (user_id,),
+                            )
+
+            if successful_sends > 0:
+                save_published(story["id"], story["title"])
+
+            logger.info(
+                "Finished story: %s. Sent to %s users.",
+                story["title"],
+                successful_sends,
+            )
+
+        except Exception:
+            logger.exception(
+                "Could not process story: %s",
+                story["title"],
+            )
+
+
+# =========================================================
+# /START COMMAND
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    add_subscriber(user_id)
+
     welcome = (
-        "⚽ *Mod Football Bot is here!*\n\n"
-        "Do you want to know about the top football tournaments and the best "
-        "teams in the world? All the best from the top European leagues — "
-        "news, stats, transfers, squads, match schedules & results, live "
-        "standings and a fan menu.\n\n"
-        "👉 *Choose the league you want to follow:*"
+        "⚽ Welcome to Mod Football Bot!\n\n"
+        "Get football news from major clubs and competitions "
+        "around the world.\n\n"
+        "📰 Fresh football news\n"
+        "🔄 Transfer updates\n"
+        "🏆 Major football competitions\n"
+        "✍️ Detailed AI-written football articles\n"
+        "📸 Relevant football images where available\n\n"
+        "You are now subscribed to automatic football news. "
+        "We check for new stories every 15 minutes.\n\n"
+        "Use the button below to view the latest headlines."
     )
-    buttons = [
-        [InlineKeyboardButton(info["name"], callback_data=f"league|{key}")]
-        for key, info in LEAGUES.items()
-    ]
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📰 Latest football headlines",
+                callback_data="news|latest",
+            )
+        ]
+    ])
+
     await update.message.reply_text(
         welcome,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown"
+        reply_markup=keyboard,
     )
 
+
 # =========================================================
-# CALLBACK HANDLER
+# BUTTON HANDLER
 # =========================================================
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_button(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    user_id = query.from_user.id
 
-    # ---- League selected ----
-    if data.startswith("league|"):
-        league_key = data.split("|", 1)[1]
-        user_prefs.setdefault(user_id, {})["league"] = league_key
-        league_name = LEAGUES[league_key]["name"]
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📰 Read all football news", callback_data="news|all")],
-            [InlineKeyboardButton("🎯 Pick a team", callback_data="pick_team")]
-        ])
+    if query.data == "news|latest":
         await query.edit_message_text(
-            f"You chose *{league_name}*.\n\n"
-            "What would you like to do?",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
+            "🔎 Getting the latest football headlines..."
         )
-        return
 
-    # ---- Read all news ----
-    if data == "news|all":
-        news = fetch_news(limit=15)
+        stories = await asyncio.to_thread(fetch_news, 10)
 
-        if not news:
-            await query.edit_message_text(
-                "😕 Sorry, no news is available right now. Try again later.",
-                reply_markup=build_read_more_keyboard()
+        if not stories:
+            await query.message.reply_text(
+                "Sorry, I could not retrieve football news right now. "
+                "Please try again later."
             )
             return
 
-        header = "📰 *Top 15 Football News*\n\n"
-        body = ""
-        for i, n in enumerate(news, 1):
-            body += f"*{i}. {n['title']}*\n{truncate(n['summary'], 150)}\n\n"
+        message = "⚽ LATEST FOOTBALL HEADLINES\n\n"
 
-        full = truncate(header + body, 3800)
-        await query.edit_message_text(
-            full + "\n_…tap READ MORE for the full story._",
-            reply_markup=build_read_more_keyboard(),
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-        return
+        for index, story in enumerate(stories, 1):
+            message += (
+                f"{index}. {story['title']}\n"
+                f"{story['link']}\n\n"
+            )
 
-    # ---- Pick a team menu ----
-    if data == "pick_team":
-        prefs = user_prefs.get(user_id, {})
-        league_key = prefs.get("league")
-        teams = LEAGUES[league_key]["teams"]
+        for part in split_message(message):
+            await query.message.reply_text(
+                part,
+                disable_web_page_preview=True,
+            )
 
-        buttons = [
-            [InlineKeyboardButton(t, callback_data=f"team|{t}")]
-            for t in teams
-        ]
-        buttons.append([InlineKeyboardButton("⬅ Back", callback_data=f"league|{league_key}")])
-        await query.edit_message_text(
-            "🎯 *Choose a team:*",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown"
-        )
-        return
-
-    # ---- Team selected ----
-    if data.startswith("team|"):
-        team = data.split("|", 1)[1]
-        prefs = user_prefs.setdefault(user_id, {})
-        prefs["team"] = team
-
-        await query.edit_message_text(
-            f"✅ You are now following *{team}*.\n"
-            f"Latest news will be sent to you every *10 minutes* automatically.",
-            parse_mode="Markdown"
-        )
-
-        await send_team_news(context, user_id, team)
-        return
 
 # =========================================================
-# SEND TEAM NEWS
+# SCHEDULER
 # =========================================================
 
-async def send_team_news(context, user_id, team):
-    news = fetch_news(team_filter=team, limit=5)
-    if not news:
-        news = fetch_news(limit=3)
-        prefix = f"ℹ️ No fresh *{team}* news right now. Latest football headlines:"
-    else:
-        prefix = f"⚽ *{team} — Latest News*"
+async def post_init(application):
+    scheduler = AsyncIOScheduler()
 
-    text = prefix + "\n\n"
-    for i, n in enumerate(news, 1):
-        text += f"*{i}. {n['title']}*\n{truncate(n['summary'], 200)}\n\n"
+    scheduler.add_job(
+        check_and_send_news,
+        trigger="interval",
+        minutes=CHECK_INTERVAL_MINUTES,
+        args=[application.bot],
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc),
+    )
 
-    text = truncate(text, 3800) + "\n_…tap READ MORE for the full story._"
+    scheduler.start()
+    application.bot_data["scheduler"] = scheduler
 
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=build_read_more_keyboard(),
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        logging.warning(f"Failed to send to {user_id}: {e}")
+    logger.info(
+        "Football news scheduler started. Checking every %s minutes.",
+        CHECK_INTERVAL_MINUTES,
+    )
 
-# =========================================================
-# SCHEDULED JOB — every 10 minutes
-# =========================================================
 
-async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
-    for user_id, prefs in list(user_prefs.items()):
-        team = prefs.get("team")
-        if team:
-            await send_team_news(context, user_id, team)
+async def post_shutdown(application):
+    scheduler = application.bot_data.get("scheduler")
+
+    if scheduler and scheduler.running:
+        scheduler.shutdown(wait=False)
+
 
 # =========================================================
 # MAIN
@@ -257,25 +704,34 @@ async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ BOT_TOKEN environment variable is missing!")
+        raise SystemExit(
+            "BOT_TOKEN is missing. Add it to Railway Variables."
+        )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    if not DEEPSEEK_API_KEY:
+        logger.warning(
+            "DEEPSEEK_API_KEY is missing. Add it to Railway Variables "
+            "before automatic article generation can work."
+        )
+
+    get_connection().close()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        periodic_update,
-        "interval",
-        minutes=10,
-        args=[app],
-        max_instances=1,
-    )
-    scheduler.start()
+    logger.info("Mod Football Bot is starting...")
 
-    logging.info("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
