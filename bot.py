@@ -1,7 +1,8 @@
 import os
 import re
 import logging
-import feedparser
+import urllib.request
+import xml.etree.ElementTree as ET
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -10,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")   # set this in Railway variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 BBC_RSS = "https://feeds.bbci.co.uk/sport/football/rss.xml"
 READ_MORE_URL = "https://www.bbc.com/sport/football"
 
@@ -51,28 +52,50 @@ def clean_html(text: str) -> str:
     return text.strip()
 
 def truncate(text: str, limit: int = 500) -> str:
-    """Cut to ~500 chars at word boundary (Telegram limit is 4096)."""
     if len(text) <= limit:
         return text
     return text[:limit].rsplit(" ", 1)[0] + "..."
 
 def fetch_news(team_filter: str = None, limit: int = 15):
-    """Fetch news from BBC RSS. If team_filter, filter by team name."""
-    feed = feedparser.parse(BBC_RSS)
-    items = feed.entries or []
+    try:
+        req = urllib.request.Request(
+            BBC_RSS,
+            headers={"User-Agent": "Mozilla/5.0 (FootballBot/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            raw = response.read()
+    except Exception as e:
+        logging.warning(f"RSS fetch failed: {e}")
+        return []
+
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        logging.warning(f"RSS parse failed: {e}")
+        return []
+
     results = []
-    for item in items:
-        title = clean_html(item.get("title", ""))
-        summary = clean_html(item.get("summary", ""))
-        link = item.get("link", READ_MORE_URL)
-        # simple relevance filter
+    for item in root.iter("item"):
+        title_el = item.find("title")
+        desc_el = item.find("description")
+        link_el = item.find("link")
+
+        title = clean_html(title_el.text if title_el is not None else "")
+        summary = clean_html(desc_el.text if desc_el is not None else "")
+        link = link_el.text if link_el is not None else READ_MORE_URL
+
+        if not title:
+            continue
+
         if team_filter:
             blob = (title + " " + summary).lower()
             if team_filter.lower() not in blob:
                 continue
+
         results.append({"title": title, "summary": summary, "link": link})
         if len(results) >= limit:
             break
+
     return results
 
 def build_read_more_keyboard():
@@ -104,7 +127,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # =========================================================
-# CALLBACK HANDLER (all button clicks)
+# CALLBACK HANDLER
 # =========================================================
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,10 +156,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- Read all news ----
     if data == "news|all":
-        prefs = user_prefs.get(user_id, {})
-        league_key = prefs.get("league")
-
-        # Optional: bias news toward the selected league's teams
         news = fetch_news(limit=15)
 
         if not news:
@@ -151,7 +170,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, n in enumerate(news, 1):
             body += f"*{i}. {n['title']}*\n{truncate(n['summary'], 150)}\n\n"
 
-        # Telegram max is 4096 chars per message -> split
         full = truncate(header + body, 3800)
         await query.edit_message_text(
             full + "\n_…tap READ MORE for the full story._",
@@ -191,18 +209,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-        # Send first batch immediately
         await send_team_news(context, user_id, team)
         return
 
 # =========================================================
-# SEND TEAM NEWS (used at pick-time and by scheduler)
+# SEND TEAM NEWS
 # =========================================================
 
 async def send_team_news(context, user_id, team):
     news = fetch_news(team_filter=team, limit=5)
     if not news:
-        # fallback: send 3 general headlines so user isn't left empty
         news = fetch_news(limit=3)
         prefix = f"ℹ️ No fresh *{team}* news right now. Latest football headlines:"
     else:
@@ -230,7 +246,6 @@ async def send_team_news(context, user_id, team):
 # =========================================================
 
 async def periodic_update(context: ContextTypes.DEFAULT_TYPE):
-    """Loop over all users who picked a team and send them their news."""
     for user_id, prefs in list(user_prefs.items()):
         team = prefs.get("team")
         if team:
@@ -249,7 +264,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    # Scheduler for 10-minute updates
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         periodic_update,
