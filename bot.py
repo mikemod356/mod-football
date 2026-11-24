@@ -30,10 +30,7 @@ from telegram.ext import (
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "football_bot.db")
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
 
 CHECK_EVERY_MINUTES = 10
 MAX_ARTICLE_WORDS = 1800
@@ -552,78 +549,48 @@ def find_matching_clubs(league_key, text):
 def story_matches_user(story, user):
     league = user["league"]
     mode = user["mode"]
-    text = f'{story["title"]} {story["summary"]}'
+    text = f'{story["title"]} {story["summary"]} {story.get("source", "")}'
     matched = find_matching_clubs(league, text)
     if mode == "all":
         return bool(matched)
     if mode == "team":
         team = user["team"] or ""
-        return team in matched
+        if team in matched:
+            return True
+        official_domain = OFFICIAL_DOMAINS.get(team, "").lower()
+        story_url = (story.get("url") or "").lower()
+        story_source = (story.get("source") or "").lower()
+        if official_domain and (
+            official_domain in story_url or official_domain in story_source
+        ):
+            return True
+        return False
     return False
 
 
-def generate_article(story):
-    if not DEEPSEEK_API_KEY:
-        logger.error("DEEPSEEK_API_KEY is missing.")
-        return None
-
-    prompt = f"""
-You are the football news writer for MOD Football Bot.
-Write a clear, engaging and accurate football news article using ONLY the information supplied below.
-Do not invent quotes, scores, dates, injuries, transfer fees, contract details, statistics, line-ups or other facts.
-If the source information is limited, write a shorter useful report rather than guessing.
-Do not present rumours as confirmed facts. Clearly say when a report is a rumour or an unconfirmed claim.
-Use simple English, a strong headline, short paragraphs and useful subheadings where appropriate.
-Aim for about 350-650 words when the source contains enough information.
-The article MUST NOT exceed {MAX_ARTICLE_WORDS} words.
-Do not include a fake source link. End with a short "Source: {story['source']}" line.
-
-HEADLINE: {story['title']}
-SOURCE: {story['source']}
-SOURCE SUMMARY: {story['summary']}
-ORIGINAL ARTICLE URL: {story['url']}
-"""
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a careful football news editor. Never make up facts."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 2200,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        DEEPSEEK_URL,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        },
-        method="POST",
+def make_news_report(story):
+    """
+    No AI/API is used. This formats the publisher's RSS description as a
+    short news update and links readers to the original report.
+    """
+    title = clean_text(story.get("title")) or "Football news update"
+    summary = clean_text(story.get("summary")) or (
+        "The publisher has shared a new update. Open the original report "
+        "using the READ MORE button for the complete story."
     )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        article = result["choices"][0]["message"]["content"].strip()
-        words = article.split()
-        if len(words) > MAX_ARTICLE_WORDS:
-            article = " ".join(words[:MAX_ARTICLE_WORDS])
-            article += "\n\n[Article shortened to fit the bot's word limit.]"
-        return article
-    except Exception as exc:
-        logger.exception("DeepSeek article generation failed: %s", exc)
-        return None
+    summary = summary[:2600]
+    source = clean_text(story.get("source")) or source_name(story.get("url", ""))
+    return (
+        f"⚽ {title}\n\n"
+        f"{summary}\n\n"
+        f"📰 Publisher: {source}\n"
+        "👇 Read the full original report using the button below."
+    )
 
 
 async def get_article(story):
-    existing = get_saved_article(story["story_id"])
-    if existing:
-        return existing
-    article = await asyncio.to_thread(generate_article, story)
-    if article:
-        save_article(story["story_id"], article)
-    return article
+    # Keep the existing function name so the rest of the bot remains compatible.
+    return make_news_report(story)
 
 
 def split_message(text, limit=MAX_TELEGRAM_TEXT):
@@ -724,7 +691,7 @@ async def check_and_send_user_news(bot, user):
 
 
 async def check_and_send_news(bot):
-    logger.info("Starting 10-minute personalised football news check.")
+    logger.info("Starting 10-minute personalised football news check (no AI API).")
     subscribers = get_subscribers()
     if not subscribers:
         logger.info("No users have completed league/news selection yet.")
@@ -947,9 +914,6 @@ async def post_shutdown(application: Application):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing from Railway Variables.")
-    if not DEEPSEEK_API_KEY:
-        logger.warning("DEEPSEEK_API_KEY is missing. The bot can find RSS stories but cannot write articles.")
-
     init_database()
     application = (
         Application.builder()
